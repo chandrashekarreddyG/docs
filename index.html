@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SnatchPicks — How it works</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  :root{--bg:#0b0e14;--fg:#e8e8ec;--surface:#12141a;--border:#23242e;--accent:#7ee787;--muted:#888;}
+  *{box-sizing:border-box;margin:0}
+  body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--fg);line-height:1.5;padding:3rem 1.5rem;max-width:980px;margin:0 auto}
+  h1{font-size:2.2rem;margin-bottom:.2rem;background:linear-gradient(90deg,#7ee787,#4fc1e9);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+  .sub{color:var(--muted);margin-bottom:2.5rem;font-size:1rem}
+  h2{font-size:1.15rem;margin:2.5rem 0 .6rem;color:var(--accent);border-bottom:1px solid var(--border);padding-bottom:.4rem}
+  .note{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;margin-bottom:2rem;color:var(--fg)}
+  .mermaid{margin:1.2rem 0;background:var(--surface);padding:1rem;border-radius:12px;border:1px solid var(--border);overflow-x:auto}
+  .mermaid svg{display:block;margin:0 auto;max-width:100%;height:auto}
+  ul{margin:.4rem 0 .8rem 1.2rem}
+  li{margin:.15rem 0}
+  code{background:#1a1b22;border:1px solid #2a2c36;padding:.05em .35em;border-radius:4px;font-size:.92em}
+  .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1.5rem;margin-top:1rem}
+</style>
+</head>
+<body>
+<h1>SnatchPicks</h1>
+<p class="sub">Community deal aggregator for India · Gen-Z · mobile-first PWA · real verified deals, no fake MRP</p>
+
+<div class="note"><b>Scope:</b> India only (<code>IN</code>, INR, <code>en_IN</code>). Niche lifecycle: <b>beauty &amp; skincare → fashion → baby &amp; parenting</b>. Auto-scraped stores: Amazon.in, Flipkart, Myntra. Affiliate-only: Nykaa, Meesho (later Ajio, FirstCry).</div>
+
+<h2>1. System architecture</h2>
+<div class="mermaid">
+graph TD
+  subgraph Clients
+    Browser[Web browser users]
+    Mobile[Expo mobile app users]
+  end
+  subgraph Frontend and API
+    Web[apps/web — Next.js 15 on Vercel]
+    MobileApp[apps/mobile — Expo React Native]
+  end
+  subgraph Data and Jobs
+    DB[(Postgres — Neon)]
+    ExpireCron[Vercel cron — expire hourly]
+    AlertCron[Vercel cron — alerts 30 min]
+    GHA[GitHub Actions — scraper 30 min]
+    Scraper[packages/scraper — Node]
+  end
+  subgraph External APIs
+    OpenAI[OpenAI moderation API]
+    ExpoPush[Expo Push API]
+    Keepa[Keepa — Amazon.in]
+    FlipkartA[Flipkart Affiliate API]
+    MyntraF[Myntra affiliate feed]
+  end
+  Browser --> Web
+  Mobile --> MobileApp
+  MobileApp --> Web
+  Web --> DB
+  ExpireCron --> Web
+  AlertCron --> Web
+  GHA --> Scraper
+  Scraper --> DB
+  Web --> OpenAI
+  Web --> ExpoPush
+  Scraper --> Keepa
+  Scraper --> FlipkartA
+  Scraper --> MyntraF
+</div>
+
+<h2>2. User roles</h2>
+<div class="mermaid">
+graph LR
+  USER[USER]
+  ADMIN[ADMIN]
+  SUPERADMIN[SUPERADMIN]
+  USER --> Browse[Browse / Vote / Submit / Alerts]
+  Auth[NextAuth v5 session] --> ADMIN --> AdminPanel[Admin / Scraper / Moderation]
+  Auth --> SUPERADMIN --> SuperPanel[Users / Full control]
+</div>
+
+<h2>3. Deal pipeline (user submission → AI moderation)</h2>
+<div class="mermaid">
+flowchart TD
+  A[SubmitDealForm] --> B[POST /api/deals]
+  B --> C[Deal status=PENDING]
+  C --> D[Moderation pipeline]
+  D --> E[URL safe check + duplicate]
+  E --> F[Price sanity + MRP inflation detector]
+  F --> G[OpenAI gpt-4o-mini]
+  G -->|confident legit| H[AUTO_APPROVED → ACTIVE]
+  G -->|confident spam/malicious| I[AUTO_REJECTED → REJECTED]
+  G -->|unclear| J[NEEDS_REVIEW → admin queue]
+  J --> K{Admin}
+  K -->|Approve| H
+  K -->|Reject| I
+</div>
+
+<h2>4. Scraper architecture (auto-ingestion)</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant GHA as GitHub Actions (30 min)
+  participant S as packages/scraper
+  participant A as Amazon.in (Keepa)
+  participant F as Flipkart (Affiliate)
+  participant M as Myntra (affiliate feed)
+  participant DB as Postgres (ScrapedDeal)
+  GHA->>S: Run adapter
+  par Amazon
+    S->>A: Fetch price drops (>=20% off, top 50)
+    A-->>S: Normalized deals
+  and Flipkart
+    S->>F: Fetch bestOffers (top 80)
+    F-->>S: Normalized deals
+  and Myntra
+    S->>M: Affiliate feed (token+URL; skips Cheerio)
+    M-->>S: Normalized deals
+  end
+  S->>DB: Upsert PENDING_REVIEW
+</div>
+
+<p><b>Note:</b> Myntra is a React SPA — Cheerio returns 0 results. The scraper requires an affiliate partner token (<code>MYNTRA_AFFILIATE_TOKEN</code> + <code>MYNTRA_FEED_URL</code>) and skips entirely without it.</p>
+
+<h2>5. Ranking, votes & expiry</h2>
+<div class="mermaid">
+flowchart TD
+  A[ACTIVE deal] --> B[Vote UP / DOWN]
+  B --> C[One vote/user/deal]
+  C --> D[Recount up/down]
+  D --> E[hotScore = net_votes / age_decay]
+  E --> F{Badge}
+  F -->|&gt;5| F1[Loot]
+  F -->|&gt;2| F2[Hot]
+  F -->|&gt;0.5| F3[Warm]
+  E --> G[Homepage: Hot / New / Top / Discussed]
+  A --> H[Status vote WORKING / EXPIRED]
+  H --> I[Update counts]
+  I --> J{Expired consensus?}
+  J -->|expired >= 10 AND >= 2x working| K[Set EXPIRED]
+</div>
+
+<h2>6. Alert delivery</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant U as User
+  participant W as Web API
+  participant DB as Postgres
+  participant C as Vercel cron (30 min)
+  participant E as Expo Push API
+  participant M as Mobile
+  U->>W: Create DealAlert (cat/store/minDiscount/keyword)
+  W->>DB: Save alert
+  C->>W: Trigger
+  W->>DB: Find new active deals (last 31 min)
+  W->>DB: Load alerts + PushTokens
+  loop Match rules
+    W->>W: Filter by category/store/discount/keyword
+  end
+  W->>E: Batched notifications (groups of 100)
+  E-->>M: Push delivered
+</div>
+
+<h2>How it works (summary)</h2>
+<div class="grid2">
+<div>
+<h3>Ingestion</h3>
+<p>Two paths: user-submitted deals go through <b>AI moderation</b> (URL safe, duplicate detect, price sanity with MRP-inflation detector, OpenAI <code>gpt-4o-mini</code>). Scraped deals (Amazon/Flipkart/Myntra) enter <b>PENDING_REVIEW</b> via GitHub Actions and become live only after admin approval.</p>
+</div>
+<div>
+<h3>Ranking</h3>
+<p>Community votes (<code>UP</code> / <code>DOWN</code>) feed a decaying hot-score. Status votes (<code>WORKING</code> / <code>EXPIRED</code>) expire stale deals when <b>expired ≥ 10 and ≥ 2× working</b>. Deal posters earn reputation (<code>+1</code> / <code>-1</code>).</p>
+</div>
+<div>
+<h3>Alerts</h3>
+<p>Filters (category, store, min discount %, keyword) trigger every 30 min. Matching notifications batch at 100 and go out via <b>Expo Push</b> to mobile devices.</p>
+</div>
+<div>
+<h3>SEO / surfaces</h3>
+<p>Sustainable SEO comes from <b>live DB pages</b>: <code>/deals/[slug]</code>, <code>/store/[slug]</code>, <code>/category/[slug]</code>, intent pages (<code>/under/[price]</code>, <code>/expiring-today</code>, <code>/sale/[event]</code>). No templated buying guides.</p>
+</div>
+</div>
+
+<div class="note">
+<b>Critical rules (CLAUDE.md):</b> No fabricated SEO pages; canonical domain is <code>snatchpicks.com</code>; sitemap/footer are generated; <code>git</code> commands must use <code>GIT_CONFIG_GLOBAL=/dev/null</code>; never <code>pnpm install</code>; never <code>prisma db push</code>; mobile is standalone (<code>cd apps/mobile &amp;&amp; npm install</code>).
+</div>
+
+<footer style="margin-top:3rem;color:var(--muted);font-size:.85rem;border-top:1px solid var(--border);padding-top:1rem">
+Built from <code>ARCHITECTURE.md</code>, <code>CLAUDE.md</code>, <code>README.md</code> · Repo: <code>github.com:Rajashekarredde/snatchpicks</code> · Page source: <a href="https://github.com/chandrashekarreddyG/docs" style="color:#4fc1e9">chandrashekarreddyG/docs</a>
+</footer>
+
+<script>
+  mermaid.initialize({startOnLoad:true,theme:'dark',themeVariables:{primaryColor:'#12141a',lineColor:'#7ee787',textColor:'#e8e8ec'}});
+</script>
+</body>
+</html>
